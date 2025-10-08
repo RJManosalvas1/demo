@@ -1,49 +1,87 @@
+// src/main/java/com/example/demo/proxy/ProxyExternalQuoteClient.java
 package com.example.demo.proxy;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
-import org.springframework.context.annotation.Primary;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+import org.springframework.context.annotation.Primary;
 
+
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+
+@Primary 
 @Component
-@Primary // este bean se inyecta por defecto donde pidan ExternalQuoteClient
 public class ProxyExternalQuoteClient implements ExternalQuoteClient {
 
-    private static final Logger log = LoggerFactory.getLogger(ProxyExternalQuoteClient.class);
+    // Local fallback quotes (ASCII only)
+    private static final List<String> LOCAL_QUOTES = List.of(
+            "La simplicidad es la maxima sofisticacion. - Leonardo da Vinci",
+            "Primero resuelve el problema, luego escribe el codigo. - John Johnson",
+            "La optimizacion prematura es la raiz de todo mal. - Donald Knuth",
+            "Hablar es barato. Muestrame el codigo! - Linus Torvalds"
+    );
 
-    private final RealExternalQuoteClient real;
-    private final Cache cache;
+    private final RestClient http;
+    private final ObjectMapper om = new ObjectMapper();
 
-    public ProxyExternalQuoteClient(RealExternalQuoteClient real, CacheManager cacheManager) {
-        this.real = real;
-        this.cache = cacheManager.getCache("externalQuotes");
+    public ProxyExternalQuoteClient() {
+        // Short timeouts so it does not block when internet is unavailable
+        SimpleClientHttpRequestFactory rf = new SimpleClientHttpRequestFactory();
+        rf.setConnectTimeout(3000);
+        rf.setReadTimeout(3000);
+
+        // If your network requires a corporate proxy, you could set it like this:
+        // Proxy netProxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress("proxy.host", 8080));
+        // rf.setProxy(netProxy);
+
+        this.http = RestClient.builder()
+                .requestFactory(rf)
+                .baseUrl("https://api.quotable.io")
+                .build();
     }
 
     @Override
+    @Cacheable("quotes") // cache controlled by CacheConfig (TTL)
     public String getQuote() {
-        final String key = "lastQuote";
-        String cached = cache.get(key, String.class);
-        if (cached != null) {
-            log.info("Quote desde CACHE (Proxy).");
-            return cached;
+        // simulate initial cost so cache effect is visible
+        try { Thread.sleep(600); } catch (InterruptedException ignored) {}
+
+        try {
+            // External API: returns JSON like {"content":"...","author":"..."}
+            String json = http.get()
+                    .uri("/random")
+                    .retrieve()
+                    .body(String.class);
+
+            if (json == null || json.isBlank()) {
+                return localFallback();
+            }
+
+            JsonNode n = om.readTree(json);
+            String content = n.path("content").asText();
+            String author  = n.path("author").asText();
+
+            if (content == null || content.isBlank()) {
+                return localFallback();
+            }
+
+            if (author == null || author.isBlank()) {
+                return content;
+            }
+            return content + " - " + author;
+
+        } catch (Exception ex) {
+            // No internet / SSL / firewall -> return local fallback
+            return localFallback();
         }
-        log.info("Quote desde REAL (Proxy llama API externa).");
-        String value = fetchWithRetry(3);
-        cache.put(key, value);
-        return value;
     }
 
-    private String fetchWithRetry(int times) {
-        RuntimeException last = null;
-        for (int i = 0; i < times; i++) {
-            try {
-                return real.getQuote();
-            } catch (RuntimeException ex) {
-                last = ex;
-            }
-        }
-        throw last;
+    private String localFallback() {
+        int i = ThreadLocalRandom.current().nextInt(LOCAL_QUOTES.size());
+        return LOCAL_QUOTES.get(i);
     }
 }
